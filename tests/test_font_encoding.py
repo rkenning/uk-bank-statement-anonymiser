@@ -200,6 +200,56 @@ class TestParseTounicodeCmap:
             assert isinstance(value, str), f"Value for key {key} is not str"
             assert len(value) == 1, f"Value for key {key} has length {len(value)}, expected 1"
 
+    @pytest.mark.unit
+    def test_parses_bfrange_sequential(self):
+        """Verify sequential beginbfrange (<lo> <hi> <start>) entries are expanded."""
+        cmap = (
+            b"/CIDInit /ProcSet findresource begin\nbegincmap\n"
+            b"2 beginbfrange\n"
+            b"<20> <22> <0020>\n"
+            b"<41> <43> <0041>\n"
+            b"endbfrange\nendcmap\nend"
+        )
+        result = _parse_tounicode_cmap(cmap)
+        assert result == {
+            0x20: " ",
+            0x21: "!",
+            0x22: '"',
+            0x41: "A",
+            0x42: "B",
+            0x43: "C",
+        }
+
+    @pytest.mark.unit
+    def test_parses_bfrange_array(self):
+        """Verify array beginbfrange (<lo> <hi> [<u1> <u2> ...]) entries are mapped."""
+        cmap = (
+            b"/CIDInit /ProcSet findresource begin\nbegincmap\n"
+            b"1 beginbfrange\n"
+            b"<80> <82> [<2022> <2018> <2019>]\n"
+            b"endbfrange\nendcmap\nend"
+        )
+        result = _parse_tounicode_cmap(cmap)
+        assert result == {
+            0x80: "\u2022",
+            0x81: "\u2018",
+            0x82: "\u2019",
+        }
+
+    @pytest.mark.unit
+    def test_parses_combined_bfrange_and_bfchar(self):
+        """Verify bfrange end-codes are not misread as bfchar when both sections exist."""
+        cmap = (
+            b"/CIDInit /ProcSet findresource begin\nbegincmap\n"
+            b"1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n"
+            b"1 beginbfrange\n<0041> <0042> <0041>\nendbfrange\n"
+            b"1 beginbfchar\n<005A> <005A>\nendbfchar\n"
+            b"endcmap\nend"
+        )
+        result = _parse_tounicode_cmap(cmap)
+        assert result == {0x0041: "A", 0x0042: "B", 0x005A: "Z"}
+        assert 0x0000 not in result
+
 
 # ---------------------------------------------------------------------------
 # Tests: _decode_raw_bytes (v1 — single-byte with forward map or Latin-1)

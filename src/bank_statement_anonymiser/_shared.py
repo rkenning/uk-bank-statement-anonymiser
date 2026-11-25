@@ -35,13 +35,12 @@ import pikepdf
 def _parse_tounicode_cmap(stream_bytes: bytes) -> dict[int, str]:
     """Parse a PDF ToUnicode CMap stream into a CID/glyph-byte → Unicode-char mapping.
 
-    Handles the ``beginbfchar`` / ``endbfchar`` sections found in standard
-    ToUnicode CMaps for both:
+    Handles both ``beginbfchar`` / ``endbfchar`` and ``beginbfrange`` /
+    ``endbfrange`` sections found in standard ToUnicode CMaps for:
     - Single-byte glyph codes (typical for WinAnsiEncoding): ``<XX>`` → ``<YYYY>``
     - Multi-byte CID codes (typical for Identity-H): ``<CCCC>`` → ``<UUUU>``
-
-    Range sections (``beginbfrange``) are ignored; only individual character
-    mappings (``bfchar``) are extracted.
+    - Sequential ranges: ``<lo> <hi> <start>``
+    - Array ranges: ``<lo> <hi> [<u1> <u2> ...]``
 
     Supports both UTF-16-BE (with BOM prefix) and Latin-1 encoded streams,
     which can occur in PDFs with custom font encodings.
@@ -71,12 +70,42 @@ def _parse_tounicode_cmap(stream_bytes: bytes) -> dict[int, str]:
 
     result: dict[int, str] = {}
 
+    # 1. Parse beginbfrange / endbfrange sections first
+    for range_block in re.finditer(r"beginbfrange\b(.*?)\bendbfrange", text, re.DOTALL):
+        block = range_block.group(1)
+        # Array form: <lo> <hi> [<u1> <u2> ...]
+        for m in re.finditer(r"<([0-9a-fA-F]{2,5})>\s*<([0-9a-fA-F]{2,5})>\s*\[(.*?)\]", block, re.DOTALL):
+            src_lo = int(m.group(1), 16)
+            src_hi = int(m.group(2), 16)
+            for offset, hex_cp in enumerate(re.findall(r"<([0-9a-fA-F]{4})>", m.group(3))):
+                if src_lo + offset > src_hi:
+                    break
+                unicode_cp = int(hex_cp, 16)
+                if unicode_cp != 0:
+                    result[src_lo + offset] = chr(unicode_cp)
+
+        # Sequential form: <lo> <hi> <unicodeStart>
+        block_no_arrays = re.sub(r"<[0-9a-fA-F]{2,5}>\s*<[0-9a-fA-F]{2,5}>\s*\[.*?\]", "", block, flags=re.DOTALL)
+        for m in re.finditer(r"<([0-9a-fA-F]{2,5})>\s*<([0-9a-fA-F]{2,5})>\s*<([0-9a-fA-F]{4})>", block_no_arrays):
+            src_lo = int(m.group(1), 16)
+            src_hi = int(m.group(2), 16)
+            dst_start = int(m.group(3), 16)
+            if src_hi >= src_lo and (src_hi - src_lo) <= 0xFFFF:
+                for offset in range(src_hi - src_lo + 1):
+                    unicode_cp = dst_start + offset
+                    if unicode_cp != 0 and unicode_cp <= 0x10FFFF:
+                        result[src_lo + offset] = chr(unicode_cp)
+
+    # 2. Strip bfrange & codespacerange sections so end-codes aren't misread as bfchar
+    bfchar_text = re.sub(r"beginbfrange\b.*?\bendbfrange", "", text, flags=re.DOTALL)
+    bfchar_text = re.sub(r"begincodespacerange\b.*?\bendcodespacerange", "", bfchar_text, flags=re.DOTALL)
+
     # Match both single-byte (<XX>) and multi-byte (<XXXX> or <XXXXX>) CID/glyph codes
     # to 4-digit Unicode code points (<YYYY>).
     # The regex accepts 2–5 hex digits for the CID, which covers both:
     # - Single-byte glyph codes (2 digits): <00> to <FF>
     # - Multi-byte CID codes (4+ digits): <0001> to <010E> (as seen in NatWest 2025)
-    for m in re.finditer(r"<([0-9a-fA-F]{2,5})>\s*<([0-9a-fA-F]{4})>", text):
+    for m in re.finditer(r"<([0-9a-fA-F]{2,5})>\s*<([0-9a-fA-F]{4})>", bfchar_text):
         cid_or_glyph = int(m.group(1), 16)
         unicode_cp = int(m.group(2), 16)
         if unicode_cp != 0:
