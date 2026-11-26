@@ -741,6 +741,17 @@ class TestDetectNumericIds:
         assert "31243535" in result, "Account number not detected"
 
     @pytest.mark.unit
+    def test_detect_numeric_ids_micr_replaces_card_and_tail_account(self):
+        micr = "<5186528968085923<427470+30274704<73X"
+
+        result = _detect_numeric_ids(micr)
+
+        assert result["5186528968085923"] != "5186528968085923"
+        assert result["30274704"] != "30274704"
+        assert "5186528968085923" not in result[micr]
+        assert "30274704" not in result[micr]
+
+    @pytest.mark.unit
     def test_detect_numeric_ids_card_number(self):
         """
         Verify detection of spaced 16-digit card number.

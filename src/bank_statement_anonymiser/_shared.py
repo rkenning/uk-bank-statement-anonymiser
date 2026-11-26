@@ -524,13 +524,18 @@ def _detect_numeric_ids(
                 result[display] = prefix + replacement_digit_section
 
             elif pattern is _MICR_LINE_RE:
-                # Preserve '<' delimiters and all non-card-number content verbatim;
-                # only replace the 16-digit card number (group 1).
+                # Replace the card number and any eight-digit account number in
+                # the MICR tail while preserving separators and check characters.
                 # group(2) is everything from the second '<' to the trailing check char.
                 card_raw = m.group(1)
                 tail = m.group(2)  # already includes the leading '<'
                 replacement_digits = _get_replacement_digits(card_raw)
                 raw_to_scrambled.setdefault(card_raw, replacement_digits)
+                result.setdefault(card_raw, replacement_digits)
+                for account_match in _ACCOUNT_RE.finditer(tail):
+                    account_raw = account_match.group(0)
+                    account_replacement = _get_replacement_digits(account_raw)
+                    tail = tail.replace(account_raw, account_replacement)
                 result[display] = "<" + replacement_digits + tail
 
             else:
@@ -576,6 +581,8 @@ def _rewrite_page_content_stream(
     pike_page: pikepdf.Page,
     pike_doc: pikepdf.Pdf,
     scramble_bytes_pairs: list[tuple[bytes, bytes]],
+    replacement_plan: dict[tuple[int, int | None], bytes] | None = None,
+    frozen_locations: set[tuple[int, int | None]] | None = None,
 ) -> bool:
     """Apply bytes-level scramble pairs to *pike_page*'s content stream.
 
@@ -610,6 +617,7 @@ def _rewrite_page_content_stream(
 
     # Build a fast lookup: original_bytes -> scrambled_bytes
     lookup: dict[bytes, bytes] = dict(scramble_bytes_pairs)
+    frozen_locations = frozen_locations or set()
 
     # ------------------------------------------------------------------
     # Pre-pass: identify Tj indices that are part of a single-char run
@@ -664,10 +672,13 @@ def _rewrite_page_content_stream(
         op = str(operator)
 
         if op == "Tj" and operands and idx not in frozen_indices:
+            location = (idx, None)
             obj = operands[0]
-            if isinstance(obj, pikepdf.String):
+            if location in frozen_locations:
+                pass
+            elif isinstance(obj, pikepdf.String):
                 raw = bytes(obj)
-                replacement = lookup.get(raw)
+                replacement = replacement_plan.get(location) if replacement_plan is not None else lookup.get(raw)
                 if replacement is not None:
                     operands = [pikepdf.String(replacement)]
                     changed = True
@@ -677,10 +688,16 @@ def _rewrite_page_content_stream(
             if isinstance(arr, pikepdf.Array):
                 new_items: list[pikepdf.Object] = []
                 arr_changed = False
-                for item in list(arr):  # type: ignore[arg-type]
+                for item_idx, item in enumerate(list(arr)):  # type: ignore[arg-type]
                     if isinstance(item, pikepdf.String):
                         raw = bytes(item)
-                        replacement = lookup.get(raw)
+                        location = (idx, item_idx)
+                        if location in frozen_locations:
+                            replacement = None
+                        elif replacement_plan is not None:
+                            replacement = replacement_plan.get(location)
+                        else:
+                            replacement = lookup.get(raw)
                         if replacement is not None:
                             new_items.append(pikepdf.String(replacement))
                             arr_changed = True

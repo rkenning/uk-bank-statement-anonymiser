@@ -148,12 +148,13 @@ logger = get_logger(__name__)
 _DIGITS: frozenset[str] = frozenset("0123456789")
 
 # Operators that always delimit a new visual line in a PDF content stream.
-# Td/TD/T* are relative moves — they always advance to a new line.
+# Td/TD are handled separately because some generators use zero-y moves to
+# position individual characters on the same visual line.
 # Tm (set text matrix) is handled separately: it only breaks the line when
 # the y-coordinate changes, allowing same-y Tm repositioning (e.g. TSB wraps
 # each word in its own BT/Tm/Tj/ET block at the same y) to accumulate across
 # fragments for multi-word phrase matching.
-_LINE_BREAK_OPS: frozenset[str] = frozenset({"Td", "TD", "T*"})
+_LINE_BREAK_OPS: frozenset[str] = frozenset({"T*"})
 
 # Threshold (in PDF user units, roughly points) below which a Tm y-coordinate
 # change is treated as the same visual line (e.g. baseline adjustment).
@@ -947,6 +948,7 @@ def _find_match_at_position(
     always_normalised: dict[str, str],
     never_phrases: frozenset[str],
     numeric_id_map: dict[str, str],
+    protect_isolated_char: bool = True,
 ) -> tuple[str, str | None, int] | None:
     """Find a match starting at position *pos* in *frags_in_line*.
 
@@ -958,6 +960,7 @@ def _find_match_at_position(
     """
     accumulated = ""
     accumulated_spaced = ""
+    deferred_builtin_end: int | None = None
     for end in range(pos, n):
         frag_decoded = frags_in_line[end].decoded
         accumulated += frag_decoded
@@ -980,10 +983,15 @@ def _find_match_at_position(
         if replacement is not None:
             return "always", replacement, end
 
-        # 4. Built-in patterns (only at full accumulation).
-        if _is_builtin_protected(accumulated):
-            return "protected", None, end
+        # 4. Built-in patterns. A single character is only inherently protected
+        # when it is an isolated fragment, not one glyph in a character-rendered line.
+        if (protect_isolated_char or len(accumulated.strip()) >= 2) and _is_builtin_protected(accumulated):
+            if protect_isolated_char:
+                return "protected", None, end
+            deferred_builtin_end = end
 
+    if deferred_builtin_end is not None:
+        return "protected", None, deferred_builtin_end
     return None
 
 
@@ -998,6 +1006,8 @@ def _build_scramble_bytes_pairs(
     bold_fonts: frozenset[str],
     numeric_id_map: dict[str, str] | None = None,
     retain_descriptions: bool = False,
+    replacement_plan: dict[tuple[int, int | None], bytes] | None = None,
+    frozen_locations: set[tuple[int, int | None]] | None = None,
 ) -> list[tuple[bytes, bytes]]:
     """Build ``(original_raw_bytes, replacement_raw_bytes)`` pairs for *pike_page*.
 
@@ -1048,7 +1058,7 @@ def _build_scramble_bytes_pairs(
         return []
 
     # Step 1a: collect (instr_idx, fragment) tuples and line boundaries.
-    indexed_fragments: list[tuple[int, _Fragment]] = []
+    indexed_fragments: list[tuple[int, int | None, _Fragment]] = []
     current_font: str = ""
     line_ends: list[int] = []
     _last_tm_y: float | None = None  # y-coordinate of the most recent Tm
@@ -1064,6 +1074,14 @@ def _build_scramble_bytes_pairs(
 
         elif op in _LINE_BREAK_OPS:
             line_ends.append(len(indexed_fragments))
+
+        elif op in {"Td", "TD"} and operands and len(operands) >= 2:
+            try:
+                ty = float(str(operands[1]))
+                if abs(ty) >= _TM_Y_THRESHOLD_UNITS:
+                    line_ends.append(len(indexed_fragments))
+            except (ValueError, TypeError):
+                line_ends.append(len(indexed_fragments))
 
         elif op == "Tm" and operands and len(operands) >= 6:
             # Tm operands: [a b c d tx ty] — ty is the y position.
@@ -1081,19 +1099,19 @@ def _build_scramble_bytes_pairs(
                 raw = bytes(operands[0])
                 if raw:
                     dec = _decode_raw_bytes_safe(raw, current_font, forward_maps, font_encodings)
-                    indexed_fragments.append((instr_idx, _Fragment(raw=raw, font=current_font, decoded=dec)))
+                    indexed_fragments.append((instr_idx, None, _Fragment(raw=raw, font=current_font, decoded=dec)))
             except (TypeError, AttributeError):
                 pass
 
         elif op == "TJ" and operands:
             try:
                 arr = operands[0]
-                for item in list(arr):  # type: ignore[arg-type]
+                for item_idx, item in enumerate(list(arr)):  # type: ignore[arg-type]
                     if isinstance(item, pikepdf.String):
                         raw = bytes(item)
                         if raw:
                             dec = _decode_raw_bytes_safe(raw, current_font, forward_maps, font_encodings)
-                            indexed_fragments.append((instr_idx, _Fragment(raw=raw, font=current_font, decoded=dec)))
+                            indexed_fragments.append((instr_idx, item_idx, _Fragment(raw=raw, font=current_font, decoded=dec)))
             except (TypeError, AttributeError):
                 pass
 
@@ -1115,14 +1133,18 @@ def _build_scramble_bytes_pairs(
     # Step 1c: for each fragment, assign a disposition via the sliding window.
     dispositions: list[str | None] = [None] * total_frags
     always_replacements: dict[int, str] = {}
+    character_run_fragments: set[int] = set()
 
     # Pre-normalise always_anonymise keys for fast lookup.
     always_normalised: dict[str, str] = {_normalise_phrase(k): v for k, v in always_cfg.replacements.items()}
 
     for line_range in lines:
-        frags_in_line = [indexed_fragments[i][1] for i in line_range]
+        frags_in_line = [indexed_fragments[i][2] for i in line_range]
         n = len(frags_in_line)
         matched_indices: set[int] = set()
+        is_character_run = n >= 2 and all(len(frag.decoded) == 1 for frag in frags_in_line)
+        if is_character_run:
+            character_run_fragments.update(line_range)
 
         pos = 0
         while pos < n:
@@ -1130,7 +1152,15 @@ def _build_scramble_bytes_pairs(
                 pos += 1
                 continue
 
-            match = _find_match_at_position(pos, n, frags_in_line, always_normalised, never_cfg.phrases, numeric_id_map)
+            match = _find_match_at_position(
+                pos,
+                n,
+                frags_in_line,
+                always_normalised,
+                never_cfg.phrases,
+                numeric_id_map,
+                protect_isolated_char=not is_character_run,
+            )
             if match:
                 kind, replacement, end = match
                 for i in range(pos, end + 1):
@@ -1154,8 +1184,8 @@ def _build_scramble_bytes_pairs(
             if retain_descriptions:
                 dispositions[i] = "protected"
             else:
-                _, frag = indexed_fragments[i]
-                if frag.font in bold_fonts or _is_builtin_protected(frag.decoded):
+                _, _, frag = indexed_fragments[i]
+                if frag.font in bold_fonts or (i not in character_run_fragments and _is_builtin_protected(frag.decoded)):
                     dispositions[i] = "protected"
                 else:
                     dispositions[i] = "scramble"
@@ -1166,33 +1196,49 @@ def _build_scramble_bytes_pairs(
     pairs: list[tuple[bytes, bytes]] = []
     seen_raw: set[bytes] = set()
 
-    for i, (instr_idx, frag) in enumerate(indexed_fragments):
+    for i, (instr_idx, item_idx, frag) in enumerate(indexed_fragments):
         raw = frag.raw
-        if raw in seen_raw:
+        location = (instr_idx, item_idx)
+        if raw in seen_raw and replacement_plan is None:
             continue
 
         disp = dispositions[i]
 
         if disp == "protected":
-            seen_raw.add(raw)
+            if frozen_locations is not None:
+                frozen_locations.add(location)
+            if replacement_plan is None:
+                seen_raw.add(raw)
             continue
 
         elif disp == "always":
             replacement_text = always_replacements.get(i)
             if replacement_text is None:
-                seen_raw.add(raw)
+                if frozen_locations is not None:
+                    frozen_locations.add(location)
+                if replacement_plan is None:
+                    seen_raw.add(raw)
                 continue
             replacement_raw = _reencode_fragment(replacement_text, frag.font, reverse_maps, font_encodings)
             if replacement_raw is None or replacement_raw == raw:
-                seen_raw.add(raw)
+                if frozen_locations is not None:
+                    frozen_locations.add(location)
+                if replacement_plan is None:
+                    seen_raw.add(raw)
                 continue
-            pairs.append((raw, replacement_raw))
+            if replacement_plan is not None:
+                replacement_plan[location] = replacement_raw
+            if raw not in seen_raw:
+                pairs.append((raw, replacement_raw))
             seen_raw.add(raw)
 
         elif disp == "scramble":
             dec = frag.decoded
             if not dec:
-                seen_raw.add(raw)
+                if frozen_locations is not None:
+                    frozen_locations.add(location)
+                if replacement_plan is None:
+                    seen_raw.add(raw)
                 continue
 
             # Handle compound tokens (payment-type prefix + description).
@@ -1202,21 +1248,33 @@ def _build_scramble_bytes_pairs(
                 desc_part = compound.group(2)
                 scrambled_desc = _scramble_text_font_aware(desc_part, scramble_map, frag.font, reverse_maps)
                 if scrambled_desc == desc_part:
-                    seen_raw.add(raw)
+                    if frozen_locations is not None:
+                        frozen_locations.add(location)
+                    if replacement_plan is None:
+                        seen_raw.add(raw)
                     continue
                 scrambled_full = prefix + scrambled_desc
             else:
                 scrambled_full = _scramble_text_font_aware(dec, scramble_map, frag.font, reverse_maps)
                 if scrambled_full == dec:
-                    seen_raw.add(raw)
+                    if frozen_locations is not None:
+                        frozen_locations.add(location)
+                    if replacement_plan is None:
+                        seen_raw.add(raw)
                     continue
 
             scrambled_raw = _reencode_fragment(scrambled_full, frag.font, reverse_maps, font_encodings)
             if scrambled_raw is None or scrambled_raw == raw:
-                seen_raw.add(raw)
+                if frozen_locations is not None:
+                    frozen_locations.add(location)
+                if replacement_plan is None:
+                    seen_raw.add(raw)
                 continue
 
-            pairs.append((raw, scrambled_raw))
+            if replacement_plan is not None:
+                replacement_plan[location] = scrambled_raw
+            if raw not in seen_raw:
+                pairs.append((raw, scrambled_raw))
             seen_raw.add(raw)
 
     # Longest-first to prevent short sequences matching inside longer ones.
@@ -1480,9 +1538,12 @@ def anonymise_pdf(
         all_text_parts: list[str] = []
         for pike_page in pike_doc.pages:
             forward_maps_pre, _, _ = _build_font_maps(pike_page)
-            for frag in _collect_fragments(pike_page, forward_maps_pre):
+            page_fragments = _collect_fragments(pike_page, forward_maps_pre)
+            for frag in page_fragments:
                 if frag.decoded:
                     all_text_parts.append(frag.decoded)
+            if page_fragments and all(len(frag.decoded) == 1 for frag in page_fragments):
+                all_text_parts.append("".join(frag.decoded for frag in page_fragments))
         all_text = " ".join(all_text_parts)
 
         logger.debug(f"pre-pass collected {len(all_text_parts)} fragment(s), {len(all_text)} chars total")
@@ -1506,6 +1567,8 @@ def anonymise_pdf(
             font_encodings, _, _ = _build_font_maps_v2(pike_page)
             logger.debug(f"page {page_num}: fonts={list(forward_maps.keys())}, bold={list(bold_fonts)}")
 
+            replacement_plan: dict[tuple[int, int | None], bytes] = {}
+            frozen_locations: set[tuple[int, int | None]] = set()
             pairs = _build_scramble_bytes_pairs(
                 pike_page,
                 scramble_map,
@@ -1517,6 +1580,8 @@ def anonymise_pdf(
                 bold_fonts,
                 numeric_id_map=numeric_id_map,
                 retain_descriptions=retain_descriptions,
+                replacement_plan=replacement_plan,
+                frozen_locations=frozen_locations,
             )
             logger.debug(f"page {page_num}: {len(pairs)} pair(s) built")
             if logger.isEnabledFor(logging.DEBUG):
@@ -1534,7 +1599,13 @@ def anonymise_pdf(
                     logger.debug(f"  ... ({len(pairs) - 20} more pair(s) not shown)")
 
             if pairs:
-                _rewrite_page_content_stream(pike_page, pike_doc, pairs)
+                _rewrite_page_content_stream(
+                    pike_page,
+                    pike_doc,
+                    pairs,
+                    replacement_plan=replacement_plan,
+                    frozen_locations=frozen_locations,
+                )
                 total_pairs += len(pairs)
 
         pike_doc.save(str(output_path), compress_streams=True)

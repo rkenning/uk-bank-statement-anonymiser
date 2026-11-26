@@ -17,7 +17,7 @@ from __future__ import annotations
 import pikepdf
 import pytest
 
-from bank_statement_anonymiser._shared import _make_scramble_map
+from bank_statement_anonymiser._shared import _make_scramble_map, _rewrite_page_content_stream
 from bank_statement_anonymiser.anonymise import (
     _AlwaysAnonymiseConfig,
     _build_font_maps,
@@ -56,6 +56,12 @@ def _tj(text: str, font: str = "/F1") -> bytes:
     encoded = text.encode("latin-1")
     escaped = encoded.replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)")
     return b"BT\n" + font.encode() + b" 12 Tf\n" + b"50 750 Td\n" + b"(" + escaped + b") Tj\n" + b"ET\n"
+
+
+def _character_run_tjs(text: str) -> bytes:
+    """Render every character as a separate Tj on one visual line."""
+    operands = b"".join(b"1 0 Td\n(" + char.encode("latin-1") + b") Tj\n" for char in text)
+    return b"BT\n/F1 12 Tf\n50 750 Td\n" + operands + b"ET\n"
 
 
 def _empty_configs() -> tuple[_AlwaysAnonymiseConfig, _NeverAnonymiseConfig]:
@@ -253,6 +259,45 @@ class TestBuildScramblePairsScramble:
         result = _build_scramble_bytes_pairs(page, scramble_map, always_cfg, never_cfg, fe, fm, rm, bf)
         originals = [orig for orig, _ in result]
         assert b"12345" not in originals
+        del pdf
+
+    @pytest.mark.unit
+    def test_single_character_run_is_scrambled_with_protected_phrase_frozen(self, mock_random_source):
+        page, pdf = _make_page(_character_run_tjs("Secret CREDIT CARD"))
+        always_cfg = _AlwaysAnonymiseConfig(replacements={})
+        never_cfg = _NeverAnonymiseConfig(phrases=frozenset(["creditcard"]))
+        scramble_map = _make_scramble_map()
+        fe, fm, rm, bf = _page_maps(page)
+        replacement_plan: dict[tuple[int, int | None], bytes] = {}
+        frozen_locations: set[tuple[int, int | None]] = set()
+
+        pairs = _build_scramble_bytes_pairs(
+            page,
+            scramble_map,
+            always_cfg,
+            never_cfg,
+            fe,
+            fm,
+            rm,
+            bf,
+            replacement_plan=replacement_plan,
+            frozen_locations=frozen_locations,
+        )
+
+        assert pairs
+        assert replacement_plan
+        assert frozen_locations
+        _rewrite_page_content_stream(
+            page,
+            pdf,
+            pairs,
+            replacement_plan=replacement_plan,
+            frozen_locations=frozen_locations,
+        )
+        instructions = list(pikepdf.parse_content_stream(page))
+        text = "".join(bytes(operands[0]).decode("latin-1") for operands, operator in instructions if str(operator) == "Tj")
+        assert text != "Secret CREDIT CARD"
+        assert text.endswith(" CREDIT CARD")
         del pdf
 
 
